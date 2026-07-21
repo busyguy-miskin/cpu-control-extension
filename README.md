@@ -77,7 +77,7 @@ cpu-control-extension/
 
 ## 安装
 
-前置:已构建 ryzenadj 并安装 ryzen_smu 内核模块(详见下方[依赖安装](#依赖安装从零开始)章节)。
+前置:已自行安装 ryzenadj 和 ryzen_smu(详见下方[前置依赖](#前置依赖)章节)。
 
 ```bash
 bash install.sh
@@ -117,71 +117,31 @@ sudo /usr/libexec/ryzenadj-tune --once
 cat /run/ryzenadj-tune.status   # 扩展读取的状态文件
 ```
 
-## 依赖安装(从零开始)
+## 前置依赖
 
-本扩展需要两个外部组件:**ryzenadj**(调优工具)和 **ryzen_smu**(内核模块)。下面是从零安装的完整步骤。
+**安装本扩展前,请自行安装以下两个组件**(本扩展不会自动安装它们):
 
-### 1. 构建并安装 ryzenadj
+| 依赖 | 说明 | 上游地址 |
+|---|---|---|
+| **ryzenadj** | Ryzen 电源管理调优工具(CLI)。需自行构建。install.sh 会把构建产物加固安装成 root 拥有副本。 | [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) |
+| **ryzen_smu** | 内核模块,ryzenadj 通过它访问 SMU。DKMS 安装,需配置开机自动加载。 | [amkillam/ryzen_smu](https://github.com/amkillam/ryzen_smu) |
 
-```bash
-# 安装编译依赖 (Ubuntu/Debian)
-sudo apt install build-essential cmake libpci-dev git
-
-# 克隆并编译
-git clone https://github.com/FlyGoat/RyzenAdj.git ~/RyzenAdj
-cd ~/RyzenAdj
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-make -C build -j"$(nproc)"
-
-# install.sh 会把构建产物加固安装到 /usr/local/bin/ryzenadj (root 拥有)
-# 所以这里只需保留构建产物, 不用手动 install
-```
-
-### 2. 安装 ryzen_smu 内核模块(DKMS)
-
-ryzenadj 通过 ryzen_smu 内核模块访问 SMU(系统管理单元)。
+请按上游仓库的安装文档操作。装好后用这条命令验证:
 
 ```bash
-# 安装 DKMS 依赖
-sudo apt install dkms linux-headers-$(uname -r)
-
-# 克隆并安装 (amkillam 的活跃维护分支)
-git clone https://github.com/amkillam/ryzen_smu.git
-cd ryzen_smu
-sudo make dkms-install
-
-# 立即加载模块
-sudo modprobe ryzen_smu
-
-# 验证 (应显示 detected compatible ryzen_smu kernel module)
 sudo ryzenadj -i
 ```
 
-### 3. 配置开机自动加载 ryzen_smu
+能看到 `detected compatible ryzen_smu kernel module` 和完整的 PM Table,说明依赖就绪,可以跑 `bash install.sh` 了。
 
-```bash
-echo "ryzen_smu" | sudo tee /etc/modules-load.d/ryzen_smu.conf
-```
+**其他环境要求:**
 
-### 验证全部就绪
-
-```bash
-# 应显示 SMU 信息 + PM Table (不报错)
-sudo ryzenadj -i
-```
-
-如果看到 `detected compatible ryzen_smu kernel module` 和完整的 PM Table,说明依赖全部就绪,可以跑 `bash install.sh` 了。
-
-> **其他 APU 用户注意:** 本扩展的默认参数(温度/电流/功耗档位)专为 4800H(35W TDP)调校。如果你的 APU 不同(Cezanne/Rembrandt/Phoenix 等),请编辑 `/etc/ryzenadj-tune.conf` 自行调整参数,否则可能限频过度或无效果。
-
-## 前置依赖(汇总)
-
-- **ryzenadj**(按上方步骤构建;install.sh 会加固安装成 root 副本)
-- **ryzen_smu 内核模块**(DKMS,按上方步骤安装 + 配置开机加载)
-- **DKMS + linux-headers**(ryzen_smu 每次内核更新需重新编译,DKMS 自动处理)
+- DKMS + linux-headers(ryzen_smu 每次内核更新需重新编译,DKMS 自动处理)
 - GNOME Shell 45/46
 - polkit(默认已装)
-- `cpu-boost-lock.service` —— **已随本扩展打包**,install.sh 自动安装
+- `cpu-boost-lock.service` —— 已随本扩展打包,install.sh 自动安装
+
+> **其他 APU 用户注意:** 本扩展的默认参数(温度/电流/功耗档位)专为 4800H(35W TDP)调校。如果你的 APU 不同(Cezanne/Rembrandt/Phoenix 等),请编辑 `/etc/ryzenadj-tune.conf` 自行调整参数,否则可能限频过度或无效果。
 
 ## 已知限制
 
