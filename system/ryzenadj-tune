@@ -1,0 +1,102 @@
+#!/bin/bash
+# /usr/libexec/ryzenadj-tune — ryzenadj 调优守护进程
+# 被 ryzenadj-tune.service (root) 调用, 周期性重新应用 ryzenadj 参数。
+#
+# 为什么需要守护进程: ryzenadj 设置是易失的 —— SMU 重置、挂起恢复、
+# 固件电源管理都会覆盖它。必须周期重应用 (参考官方 readjust.py 思路)。
+#
+# 副作用: 每次应用后把 ryzenadj -i 输出写到 /run/ryzenadj-tune.status,
+# 供 GNOME 扩展 (普通用户) 只读展示, 无需额外提权。
+#
+# 用法:
+#   /usr/libexec/ryzenadj-tune           # 守护循环 (systemd 调用)
+#   /usr/libexec/ryzenadj-tune --once    # 应用一次后退出 (手动测试)
+
+set -euo pipefail
+
+CONF=/etc/ryzenadj-tune.conf
+STATUS=/run/ryzenadj-tune.status
+STATUS_TMP="${STATUS}.tmp"
+
+# ---------- 定位 ryzenadj ----------
+RYZENADJ=""
+for cand in /usr/local/bin/ryzenadj /usr/bin/ryzenadj; do
+    if [[ -x "$cand" ]]; then
+        RYZENADJ="$cand"
+        break
+    fi
+done
+if [[ -z "$RYZENADJ" ]]; then
+    echo "ryzenadj-tune: 找不到 ryzenadj 二进制 (已查 /usr/local/bin /usr/bin)" >&2
+    exit 1
+fi
+
+# ---------- 优雅退出 ----------
+RUNNING=1
+term_handler() {
+    RUNNING=0
+}
+trap term_handler SIGTERM SIGINT
+
+# ---------- 读配置 ----------
+if [[ ! -r "$CONF" ]]; then
+    echo "ryzenadj-tune: 配置文件 $CONF 不可读" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$CONF"
+ARGS="${ARGS:-}"
+INTERVAL="${INTERVAL:-30}"
+
+if [[ -z "$ARGS" ]]; then
+    echo "ryzenadj-tune: CONF 中 ARGS 为空, 无需应用" >&2
+    exit 0
+fi
+
+# ---------- 防御性加载 ryzen_smu (失败不致命, ryzenadj 会 fallback /dev/mem) ----------
+if ! lsmod | grep -q '^ryzen_smu '; then
+    modprobe ryzen_smu 2>/dev/null || true
+fi
+
+# ---------- 单次应用 ----------
+# 跑 ryzenadj -i <参数>, 输出(应用后的信息表)原子写入 status 文件。
+# 成功返回 0, 失败返回 ryzenadj 的 exit code。
+apply_once() {
+    # -i: 调整后显示重要指标 → 一条命令同时完成应用 + 采集状态
+    if "$RYZENADJ" -i $ARGS > "$STATUS_TMP" 2>&1; then
+        chmod 0644 "$STATUS_TMP"
+        mv -f "$STATUS_TMP" "$STATUS"
+        return 0
+    else
+        local rc=$?
+        echo "ryzenadj-tune: ryzenadj 应用失败 (exit $rc)" >&2
+        rm -f "$STATUS_TMP"
+        return $rc
+    fi
+}
+
+# ---------- --once 模式 ----------
+if [[ "${1:-}" == "--once" ]]; then
+    apply_once
+    echo "✅ 已应用一次: $ARGS"
+    echo "   状态文件: $STATUS"
+    exit 0
+fi
+
+# ---------- 守护循环 ----------
+echo "ryzenadj-tune: 启动 (间隔 ${INTERVAL}s)"
+echo "ryzenadj-tune: 参数 $ARGS"
+# 首次立即应用
+apply_once || true
+
+while [[ $RUNNING -eq 1 ]]; do
+    # 用 sleep 被 SIGTERM 打断的方式循环 (比纯 sleep 更快响应停止)
+    for ((i=0; i<INTERVAL && RUNNING==1; i++)); do
+        sleep 1
+    done
+    [[ $RUNNING -eq 1 ]] || break
+    apply_once || true
+done
+
+echo "ryzenadj-tune: 已停止"
+exit 0

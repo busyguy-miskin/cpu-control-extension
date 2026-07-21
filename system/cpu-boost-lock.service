@@ -1,0 +1,17 @@
+[Unit]
+Description=Disable CPU boost + lock freq to 2.9GHz (fix 4800H L3 MCE)
+# 第 1 层: 在 cpufreq sysfs 就绪后运行
+After=systemd-modules-load.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 1. 关闭 boost (根治 4800H L3 缓存电压波动 MCE 的关键开关)
+# 2. 锁上限到 2.9 GHz (4800H 基础频率安全档, 空闲时仍允许降频省电)
+ExecStart=/bin/bash -c 'echo 0 > /sys/devices/system/cpu/cpufreq/boost; for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do echo 2900000 > "$f"; done'
+# 停止时无需特别处理 (关机/重启时 sysfs 会重置)
+ExecStop=/bin/true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+
+<!--
+  CPU Boost 控制器 polkit 策略
+  授权 pkexec 执行 /usr/libexec/cpuctrl (仅这一个脚本, 非 NOPASSWD ALL)
+  auth_admin_keep: 输一次密码, 5 分钟内免重复弹窗
+-->
+<policyconfig>
+  <vendor>miskin</vendor>
+  <vendor_url></vendor_url>
+
+  <action id="org.miskin.cpuctrl.manage">
+    <description>控制 CPU boost 锁定状态</description>
+    <message>修改 CPU 睿频(boost)设置需要管理员授权</message>
+    <icon_name>preferences-system-symbolic</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/cpuctrl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

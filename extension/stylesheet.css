@@ -1,0 +1,18 @@
+/* CPU 控制器扩展样式 */
+
+/* 锁图标(emoji) */
+.cpuctrl-lock {
+    font-size: 12px;
+}
+
+/* 频率显示(顶栏)— 和温度一样大小 */
+.cpuctrl-freq {
+    font-size: 12px;
+    font-weight: bold;
+}
+
+/* 温度数字 — 和频率一样大小 */
+.cpuctrl-temp {
+    font-size: 12px;
+    font-weight: bold;
+}

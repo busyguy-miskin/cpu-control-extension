@@ -1,0 +1,127 @@
+#!/bin/bash
+# /usr/libexec/cpuctrl — CPU 控制 root helper
+# 被 pkexec 调用(经 polkit 提权), 参数严格校验防注入。
+#
+# 管理两层控制:
+#   第 1 层 (sysfs):  boost 锁定/解锁 (lock/unlock)
+#   第 2 层 (ryzenadj): 调优档位 (tune eco|balance|performance|off)
+#
+# 用法:
+#   pkexec /usr/libexec/cpuctrl lock|unlock                # 第 1 层
+#   pkexec /usr/libexec/cpuctrl tune eco|balance|performance|off  # 第 2 层
+#   pkexec /usr/libexec/cpuctrl status                     # 查询两层状态
+
+set -euo pipefail
+
+BOOST_SYS=/sys/devices/system/cpu/cpufreq/boost
+SVC=cpu-boost-lock.service
+TUNE_SVC=ryzenadj-tune.service
+TUNE_CONF=/etc/ryzenadj-tune.conf
+
+# ---------- 第 2 层: 档位 → ryzenadj 参数 (硬编码白名单) ----------
+# 单位: 功率 mW / 电流 mA / 温度 °C
+declare -A TUNE_ARGS=(
+    [eco]='--tctl-temp=80 --vrmmax-current=80000 --fast-limit=38000'
+    [balance]='--tctl-temp=90 --vrmmax-current=85000 --fast-limit=45000'
+    [performance]='--tctl-temp=95 --vrmmax-current=90000 --fast-limit=55000'
+)
+declare -A TUNE_LABEL=(
+    [eco]='节能 (80°C / 80A / 38W)'
+    [balance]='均衡 (90°C / 85A / 45W)'
+    [performance]='性能 (95°C / 90A / 55W)'
+)
+
+# 把档位参数写入 conf 的 ARGS 行, 保留其余行(注释/INTERVAL)
+write_tune_conf() {
+    local profile="$1"
+    local args="${TUNE_ARGS[$profile]}"
+    local tmp
+    tmp=$(mktemp)
+    # 已有 conf 则改写 ARGS 行; 否则用默认模板
+    if [[ -f "$TUNE_CONF" ]]; then
+        # 删掉旧 ARGS 行, 追加新的
+        grep -v '^ARGS=' "$TUNE_CONF" > "$tmp" || true
+        echo "ARGS=\"$args\"" >> "$tmp"
+    else
+        echo "# 由 cpuctrl 生成" > "$tmp"
+        echo "ARGS=\"$args\"" >> "$tmp"
+        echo "INTERVAL=30" >> "$tmp"
+    fi
+    install -m 0644 -o root -g root "$tmp" "$TUNE_CONF"
+    rm -f "$tmp"
+}
+
+# ---------- 反查当前 conf 的 ARGS 属于哪个档位 (供 status 用) ----------
+current_tune_profile() {
+    local args=""
+    if [[ -r "$TUNE_CONF" ]]; then
+        # shellcheck disable=SC1090
+        args=$(source "$TUNE_CONF" && echo "${ARGS:-}")
+    fi
+    for p in "${!TUNE_ARGS[@]}"; do
+        if [[ "$args" == "${TUNE_ARGS[$p]}" ]]; then
+            echo "$p"
+            return
+        fi
+    done
+    # 不匹配任何预设档位 = 自定义
+    echo "custom"
+}
+
+case "${1:-}" in
+    # ==================== 第 1 层: boost (sysfs) ====================
+    lock)
+        echo 0 > "$BOOST_SYS"
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            echo 2900000 > "$f"
+        done
+        systemctl enable --now "$SVC" 2>/dev/null || true
+        echo "✅ 已锁定 boost (boost=0, 频率上限 2.9GHz, 自启已启用)"
+        ;;
+    unlock)
+        echo 1 > "$BOOST_SYS"
+        # 恢复频率上限到硬件最大值 (lock 时压到了 2.9GHz, 不恢复会一直被限)
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            maxfreq=$(cat "${f%scaling_max_freq}cpuinfo_max_freq" 2>/dev/null || echo 2900000)
+            echo "$maxfreq" > "$f"
+        done
+        systemctl disable --now "$SVC" 2>/dev/null || true
+        echo "✅ 已解锁 boost (boost=1, 频率上限已恢复, 自启已禁用)"
+        ;;
+
+    # ==================== 第 2 层: ryzenadj 调优 ====================
+    tune)
+        profile="${2:-}"
+        case "$profile" in
+            eco|balance|performance)
+                write_tune_conf "$profile"
+                systemctl enable --now "$TUNE_SVC" 2>/dev/null || true
+                systemctl restart "$TUNE_SVC" 2>/dev/null || true
+                echo "✅ 调优档位: ${TUNE_LABEL[$profile]}"
+                echo "   守护进程已重启, 参数已应用"
+                ;;
+            off)
+                systemctl stop "$TUNE_SVC" 2>/dev/null || true
+                systemctl disable "$TUNE_SVC" 2>/dev/null || true
+                echo "✅ 已关闭 ryzenadj 调优 (守护已停, 回到出厂功耗/温度/电流墙)"
+                ;;
+            *)
+                echo "Usage: $0 tune {eco|balance|performance|off}" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+
+    # ==================== 状态查询 (两层) ====================
+    status)
+        echo "boost=$(cat "$BOOST_SYS" 2>/dev/null || echo '?')"
+        echo "boost_service=$(systemctl is-enabled "$SVC" 2>/dev/null || echo '?')"
+        echo "tune_profile=$(current_tune_profile)"
+        echo "tune_service=$(systemctl is-active "$TUNE_SVC" 2>/dev/null || echo '?')"
+        ;;
+
+    *)
+        echo "Usage: $0 {lock|unlock|tune eco|balance|performance|off|status}" >&2
+        exit 1
+        ;;
+esac

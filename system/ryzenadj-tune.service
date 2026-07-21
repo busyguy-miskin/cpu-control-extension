@@ -1,0 +1,17 @@
+[Unit]
+Description=RyzenAdj tuning daemon (thermal/current/power limits for 4800H)
+# 调优层与 boost 锁层完全独立。
+# 只用 After 做启动排序(若 boost 锁恰好在启动则排在前面),
+# 绝不用 Wants/Requires —— 那会在启动调优时强制拉起 boost 锁, 违背
+# "安装/启动调优不擅自动 boost 状态"的原则。两层各自独立启停。
+After=cpu-boost-lock.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/ryzenadj-tune
+# 守护进程崩溃自动重启
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

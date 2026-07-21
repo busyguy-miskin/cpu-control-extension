@@ -1,0 +1,8 @@
+{
+  "uuid": "cpu-control@miskin",
+  "name": "CPU 控制 (4800H 调优)",
+  "description": "双层 CPU 控制:顶栏显示温度/频率/boost/MCE 状态,一键锁定或解锁睿频 + ryzenadj 调优档位(节能/均衡/性能)。经 polkit 提权。专为 4800H L3 缓存电压不稳设计。",
+  "shell-version": ["45", "46"],
+  "version": "1",
+  "url": "https://github.com/miskin/cpu-control-extension"
+}
