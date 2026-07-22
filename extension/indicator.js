@@ -60,14 +60,20 @@ function readFreq() {
 }
 
 // 异步读 MCE 计数(用 journalctl, adm 组用户可读)
+//
+// 必须用 communicate_utf8_async, 不能用 wait_check_async + communicate 两步。
+// 后者是"先等进程退出, 再排空 stdout 管道"的顺序; 当 journalctl 输出
+// 超过 Linux 管道缓冲(64 KB)时, 子进程会写满管道阻塞在 write, 永不退出,
+// 于是 wait_check 的回调永不触发 → MCE 计数永远卡在初始值 0 (本机实测输出 ~150 KB,
+// 必中)。communicate_utf8_async 在等待退出的同时并发排空管道, 不会死锁。
 function readMceCountAsync(cb) {
     try {
         const proc = Gio.Subprocess.new(
             ['journalctl', '-k', '-b', '0', '--no-pager'],
             Gio.SubprocessFlags.STDOUT_PIPE);
-        proc.wait_check_async(null, (proc, res) => {
+        proc.communicate_utf8_async(null, null, (proc, res) => {
             try {
-                const [, stdout] = proc.communicate_utf8(null, null);
+                const [, stdout] = proc.communicate_utf8_finish(res);
                 cb((stdout.match(/Machine check events logged/g) || []).length);
             } catch (e) {
                 cb(0);
@@ -89,15 +95,14 @@ function readTuneActive() {
     }
 }
 
-// 读守护进程写出的 ryzenadj 状态文件, 解析三组 LIMIT/VALUE。
+// 读守护进程写出的 ryzenadj 状态文件, 解析两组 LIMIT/VALUE。
 // 文件是 `ryzenadj -i` 的输出(PM table), 格式如:
 //   | PPT LIMIT FAST | 45.000 | fast-limit |
 //   | PPT VALUE FAST | 17.123 |            |
-//   | EDC LIMIT VDD  | 85.000 | ...        |
-//   | EDC VALUE VDD  | 74.000 |            |
 //   | THM LIMIT CORE | 90.000 | ...        |
 //   | THM VALUE CORE | 72.000 |            |
-// 返回 {tempLimit, tempVal, edcLimit, edcVal, fastLimit, fastVal} 或 null
+// 只取温度墙 + 功耗两组 (电流 EDC 不调, 见 cpuctrl TUNE_ARGS)。
+// 返回 {tempLimit, tempVal, fastLimit, fastVal} 或 null
 function readRyzenStatus() {
     const raw = readSys(TUNE_STATUS);
     if (!raw) return null;
@@ -111,8 +116,6 @@ function readRyzenStatus() {
         switch (name) {
             case 'THM LIMIT CORE': result.tempLimit = val; break;
             case 'THM VALUE CORE': result.tempVal = val; break;
-            case 'EDC LIMIT VDD':  result.edcLimit = val; break;
-            case 'EDC VALUE VDD':  result.edcVal = val; break;
             case 'PPT LIMIT FAST': result.fastLimit = val; break;
             case 'PPT VALUE FAST': result.fastVal = val; break;
         }
@@ -139,6 +142,14 @@ function formatFreqFull(freqMHz) {
     return freqMHz >= 1000
         ? (freqMHz / 1000).toFixed(2) + ' GHz'
         : freqMHz + ' MHz';
+}
+
+// 统一的限值/实测格式 (null 安全, 实测四舍五入)
+// 95,72,'°C' → "95/72°C"   55,17,'W' → "55/17W"
+function formatLimitVal(limit, val, unit) {
+    const l = limit != null ? limit : '?';
+    const v = val != null ? Math.round(val) : '?';
+    return `${l}/${v}${unit}`;
 }
 
 // ============================================================
@@ -197,6 +208,9 @@ export const CpuIndicator = GObject.registerClass(
             // 状态缓存
             this._mceCount = 0;
             this._locked = true;
+            // 实时读数缓存: 供菜单状态行复用, 保证与顶栏同源同节奏
+            this._cpuTemp = null;
+            this._freq = null;
 
             // 构建菜单
             this._buildMenu();
@@ -250,9 +264,9 @@ export const CpuIndicator = GObject.registerClass(
 
             // ===== 调优档位(子菜单) =====
             const tuneSub = new PopupMenu.PopupSubMenuMenuItem('调优档位');
-            this._addActionTo(tuneSub.menu, '🟢 节能 (80°C / 80A / 38W)', ['tune', 'eco']);
-            this._addActionTo(tuneSub.menu, '⚖️ 均衡 (90°C / 85A / 45W)', ['tune', 'balance']);
-            this._addActionTo(tuneSub.menu, '🚀 性能 (95°C / 90A / 55W)', ['tune', 'performance']);
+            this._addActionTo(tuneSub.menu, '🟢 节能 (80°C / 38W)', ['tune', 'eco']);
+            this._addActionTo(tuneSub.menu, '⚖️ 均衡 (90°C / 45W)', ['tune', 'balance']);
+            this._addActionTo(tuneSub.menu, '🚀 性能 (95°C / 55W)', ['tune', 'performance']);
             this._addActionTo(tuneSub.menu, '⏹️ 关闭调优 (回出厂)', ['tune', 'off']);
             this.menu.addMenuItem(tuneSub);
         }
@@ -292,15 +306,17 @@ export const CpuIndicator = GObject.registerClass(
         // ---------- 刷新 ----------
 
         // 刷新菜单状态行文字(频率/boost/调优)。可被两个场景调用:
-        //   - 定时器(菜单关闭时): 避免打开时改文字干扰布局
-        //   - 打开菜单瞬间: 确保再打开看到的是最新值
-        _refreshMenuItems(freq) {
+        //   - 定时器每个 tick (含菜单打开期间): 温度/频率持续更新, 与顶栏同源同节奏
+        //   - 打开菜单瞬间: open-state-changed 信号触发, 不必等下一个 tick
+        // 不再收 freq 参数: 频率/温度都从 _refreshFast 缓存的实例状态读取,
+        // 避免 open-state-changed 不带参数时 formatFreqFull(undefined) 渲染成 "undefined MHz"
+        _refreshMenuItems() {
             if (this._statusBoost) {
                 this._statusBoost.label.text =
                     `Boost: ${this._locked ? '🔒 已锁定' : '🔓 已解锁'} (MCE: ${this._mceCount})`;
             }
             if (this._statusFreq) {
-                this._statusFreq.label.text = `频率: ${formatFreqFull(freq)}`;
+                this._statusFreq.label.text = `频率: ${formatFreqFull(this._freq)}`;
             }
             this._updateTuneStatus();
         }
@@ -311,16 +327,18 @@ export const CpuIndicator = GObject.registerClass(
             const freq = readFreq();
             this._locked = readBoost() === '0';
 
+            // 缓存实时读数, 供菜单状态行复用 (温度墙实测值也用这个, 保证与顶栏同源)
+            this._cpuTemp = temp;
+            this._freq = freq;
+
             // 更新顶栏(随时刷新)
             this._tempLabel.text = temp !== null ? `${temp}°` : '—°';
             this._lockIcon.text = this._locked ? '🔒' : '🔓';
             this._freqLabel.text = formatFreqCompact(freq);
 
-            // 菜单关闭时才刷新菜单项文字, 避免打开时自动刷新干扰布局
-            // (打开时的刷新由 open-state-changed 信号专门触发)
-            if (!this.menu.isOpen) {
-                this._refreshMenuItems(freq);
-            }
+            // 菜单项文字每个 tick 都刷新 (含打开期间), 让菜单内温度与顶栏一致;
+            // 打开瞬间的首刷由 open-state-changed 信号额外触发一次
+            this._refreshMenuItems();
         }
 
         // 刷新第 2 层调优状态行(读守护进程写出的 status 文件)
@@ -342,22 +360,22 @@ export const CpuIndicator = GObject.registerClass(
             }
 
             this._statusTune.label.text = '调优: ✅ 运行中';
-            // 三行详情压成两行: 温度墙 / 电流 / 功耗
-            const tempStr = `${r.tempLimit ?? '?'}°C (${r.tempVal != null ? Math.round(r.tempVal) : '?'}°)`;
-            const edcStr = `${r.edcLimit ?? '?'}/${r.edcVal != null ? Math.round(r.edcVal) : '?'}A`;
-            const fastStr = `${r.fastVal != null ? Math.round(r.fastVal) : '?'}/${r.fastLimit ?? '?'}W`;
+            // 详情: 温度墙 + 功耗, 统一用 "限值/实测" 格式 (限值在前, 斜杠分隔, 单位各自尾随)
+            // - 温度墙限值取 ryzenadj 的 tctl-temp; 实测温度用 k10temp 实时核温 (this._cpuTemp),
+            //   与顶栏同源同节奏, 避免菜单里显示另一颗 SMU 传感器导致两边温度不一致
+            // - 功耗限值/实测都取 ryzenadj SMU 的 PPT FAST
+            const tempStr = formatLimitVal(r.tempLimit, this._cpuTemp, '°C');
+            const fastStr = formatLimitVal(r.fastLimit, r.fastVal, 'W');
             this._statusTuneDetail.label.text =
-                `温度墙 ${tempStr}  ·  EDC ${edcStr}  ·  功耗 ${fastStr}`;
+                `温度墙 ${tempStr}  ·  功耗 ${fastStr}`;
         }
 
         // 慢速刷新: MCE 计数
         _refreshMce() {
             readMceCountAsync((count) => {
                 this._mceCount = count;
-                if (this._statusBoost && !this.menu.isOpen) {
-                    this._statusBoost.label.text =
-                        `Boost: ${this._locked ? '🔒 已锁定' : '🔓 已解锁'} (MCE: ${this._mceCount})`;
-                }
+                // 直接走统一的菜单刷新 (内部已判空), 打开菜单时也更新
+                this._refreshMenuItems();
             });
         }
 

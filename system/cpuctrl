@@ -19,16 +19,17 @@ TUNE_SVC=ryzenadj-tune.service
 TUNE_CONF=/etc/ryzenadj-tune.conf
 
 # ---------- 第 2 层: 档位 → ryzenadj 参数 (硬编码白名单) ----------
-# 单位: 功率 mW / 电流 mA / 温度 °C
+# 只调 温度墙 + 功耗, 不碰电流(EDC 限太低反而引发欠流不稳)。
+# 单位: 功率 mW / 温度 °C
 declare -A TUNE_ARGS=(
-    [eco]='--tctl-temp=80 --vrmmax-current=80000 --fast-limit=38000'
-    [balance]='--tctl-temp=90 --vrmmax-current=85000 --fast-limit=45000'
-    [performance]='--tctl-temp=95 --vrmmax-current=90000 --fast-limit=55000'
+    [eco]='--tctl-temp=80 --fast-limit=38000'
+    [balance]='--tctl-temp=90 --fast-limit=45000'
+    [performance]='--tctl-temp=95 --fast-limit=55000'
 )
 declare -A TUNE_LABEL=(
-    [eco]='节能 (80°C / 80A / 38W)'
-    [balance]='均衡 (90°C / 85A / 45W)'
-    [performance]='性能 (95°C / 90A / 55W)'
+    [eco]='节能 (80°C / 38W)'
+    [balance]='均衡 (90°C / 45W)'
+    [performance]='性能 (95°C / 55W)'
 )
 
 # 把档位参数写入 conf 的 ARGS 行, 保留其余行(注释/INTERVAL)
