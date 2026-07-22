@@ -16,3 +16,14 @@
     font-size: 12px;
     font-weight: bold;
 }
+
+/* 菜单警告区标题 (Adwaita warning 橙色) */
+.cpuctrl-warn {
+    color: #f57900;
+    font-weight: bold;
+}
+
+/* 被环境检查阻断的置灰操作项 */
+.cpuctrl-disabled {
+    opacity: 0.5;
+}

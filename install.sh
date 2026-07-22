@@ -182,9 +182,19 @@ if [[ -n "$RYZENADJ_SRC" ]]; then
     sudo install -m 0755 -o root -g root "$RYZENADJ_SRC" "$RYZENADJ_DST"
     ok "ryzenadj 已安装 (源: $RYZENADJ_SRC → $RYZENADJ_DST, root:root)"
 else
-    warn "找不到 ryzenadj 二进制, 跳过加固"
-    echo "       守护进程会尝试用 PATH 中的 ryzenadj"
-    echo "       请先构建 ryzenadj (见 README 依赖安装章节)"
+    warn "找不到 ryzenadj 二进制, 第 2 层调优将不可用"
+    echo "       第 1 层 (boost 锁) 不受影响, 可正常使用"
+    echo "       如需调优, 请先构建 ryzenadj (见 README 依赖安装章节)"
+fi
+
+# 5b. ryzen_smu 内核模块检查 (只读 /sys/module, 不主动 modprobe — 避免安装时改内核状态)
+# 运行时验证 (含主动 modprobe + ryzenadj 试运行) 交给扩展 preflight, 用户点调优时顺带做。
+echo "     检查 ryzen_smu 内核模块 (只读检测, 不自动加载)"
+if [[ -d /sys/module/ryzen_smu ]]; then
+    ok "ryzen_smu 当前已加载"
+else
+    warn "ryzen_smu 当前未加载 — 首次点调优时扩展会尝试加载 (需 root)"
+    echo "       若持续失败, 请安装 ryzen_smu (DKMS) + linux-headers, 见 README 依赖安装章节"
 fi
 
 # 6. 安装守护脚本(系统级)
@@ -202,33 +212,34 @@ if [[ -f "$TUNE_CONF_DST" ]]; then
     ok "已有配置已备份 (.bak.*), 保留用户改动不覆盖"
 else
     sudo install -m 0644 -o root -g root "$SYS_SRC/ryzenadj-tune.conf" "$TUNE_CONF_DST"
-    ok "配置已安装 (均衡档: 90°C / 85A / 45W)"
+    ok "配置已安装 (默认均衡档 90°C / 45W, 启动调优后才生效)"
 fi
 
-# 8. 安装 systemd unit(调优 + boost 锁) 并启动调优(系统级)
+# 8. 安装 systemd unit(调优 + boost 锁)— 只装文件, 不启动不 enable
+# 两层都遵循"安装不擅自改运行状态"原则: unit 就位即可, 是否启动交给用户
+# 通过扩展菜单决定 (调优档位 / boost 锁切换都会自行 enable+start 对应 service)。
 echo
 echo "[8/9] 安装 systemd unit 文件"
 sudo install -m 0644 -o root -g root "$SYS_SRC/ryzenadj-tune.service" "$TUNE_UNIT_DST"
 sudo install -m 0644 -o root -g root "$SYS_SRC/cpu-boost-lock.service" "$BOOST_UNIT_DST"
 sudo systemctl daemon-reload
-ok "unit 文件已就位 (ryzenadj-tune + cpu-boost-lock)"
-# 调优 service: 安装即启动 (用户已选择开启调优)
-sudo systemctl enable --now "$TUNE_SVC" 2>/dev/null || true
-if systemctl is-active "$TUNE_SVC" >/dev/null 2>&1; then
-    ok "$TUNE_SVC 已启动并设为开机自启"
-else
-    warn "$TUNE_SVC 启动失败 (可能缺 ryzenadj 或 ryzen_smu, 见 journalctl -u $TUNE_SVC)"
-fi
+ok "unit 文件已就位 (ryzenadj-tune + cpu-boost-lock, 不预设启停状态)"
 
-# 9. boost 锁状态说明(只安装 unit, 绝不擅自动 boost 状态)
+# 9. 两层状态说明 — 如实报告当前 service 状态 (安装不启动, 也不停止已有的)
 echo
-echo "[9/9] boost 锁层就绪"
-if systemctl is-enabled "$BOOST_SVC" >/dev/null 2>&1; then
-    ok "$BOOST_SVC 已就绪并 enabled (开机自动锁 boost=0)"
+echo "[9/9] 安装完成 (不修改任何运行状态)"
+# 如实报告: 重装时若 service 之前就在跑, 这里保持运行 (不擅自停止)
+if systemctl is-active "$TUNE_SVC" >/dev/null 2>&1; then
+    ok "$TUNE_SVC: 当前正在运行 (保持现状, 未停止)"
 else
-    ok "$BOOST_SVC 已就绪 (当前 disabled, 开机不会动 boost)"
+    ok "$TUNE_SVC: 已就绪 (当前未启动, 点扩展菜单档位即激活)"
 fi
-echo "       boost 锁/解锁随时通过扩展菜单切换, 安装不预设任何状态"
+if systemctl is-active "$BOOST_SVC" >/dev/null 2>&1; then
+    ok "$BOOST_SVC: 当前正在运行 (保持现状, 未停止)"
+else
+    ok "$BOOST_SVC: 已就绪 (当前未启动, 点扩展菜单锁定即激活)"
+fi
+echo "       安装既不启动也未停止任何 service — 完全保留当前运行状态"
 
 echo
 echo "${GREEN}✅ 安装完成${NC}"
@@ -237,6 +248,7 @@ echo "下一步: 让扩展生效"
 echo "  1. 重启 GNOME Shell: Alt+F2 → 输入 r → 回车"
 echo "     (Wayland 用户需注销重新登录)"
 echo "  2. 启用扩展: gnome-extensions enable $EXT_UUID"
+echo "  3. 通过扩展下拉菜单按需开启 (boost 锁 / 调优档位)"
 echo
-echo "调优档位在扩展下拉菜单里切换(节能/均衡/性能/关闭)"
-echo "卸载: bash install.sh --uninstall"
+echo "注: 安装不会修改任何运行状态 (boost/频率/功耗/温度墙均保持当前值)"
+echo "    卸载: bash install.sh --uninstall"

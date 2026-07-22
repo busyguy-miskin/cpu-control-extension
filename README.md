@@ -85,9 +85,9 @@ cpu-control-extension/
 bash install.sh
 ```
 
-安装后重启 GNOME Shell(X11:`Alt+F2` → `r`;Wayland:注销重登)。
+安装后重启 GNOME Shell(X11:`Alt+F2` → `r`;Wayland:注销重登),然后启用扩展(`gnome-extensions enable cpu-control@miskin`)。**最后通过扩展下拉菜单按需开启** boost 锁或调优档位——安装本身不会改变任何系统状态。
 
-安装脚本会做 9 步:扩展 → cpuctrl helper → polkit 策略 → **加固 ryzenadj 二进制**(装成 root 拥有副本,避免提权隐患)→ 守护脚本 → 配置文件(已有则备份不覆盖)→ systemd unit(调优 + boost 锁)→ 启动调优层。
+> **安装不会修改任何运行状态。** boost 开关、CPU 频率、功耗/温度墙均保持当前值;两个 systemd service 都只是就位,不启动、不开机自启。是否启用、何时启用,完全由你通过扩展菜单决定(点档位/锁定即激活对应 service)。
 
 ## 卸载
 

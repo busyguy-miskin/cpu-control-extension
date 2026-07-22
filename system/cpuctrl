@@ -121,8 +121,61 @@ case "${1:-}" in
         echo "tune_service=$(systemctl is-active "$TUNE_SVC" 2>/dev/null || echo '?')"
         ;;
 
+    # ==================== 深度依赖检查 (供扩展诊断) ====================
+    # 单次提权调用, 输出机器可解析的 "key=state|msg" 行 (state ∈ ok|fail|warn)。
+    # 扩展侧用 _parsePreflight() 正则解析。退出码 0=全过, 非 0=有 fail 项。
+    # 用于: 用户首次点击调优时顺带做深度确认 (复用 polkit 密码框, 不额外打扰)。
+    preflight)
+        rc=0
+
+        # ryzenadj 二进制 (与守护脚本 ryzenadj-tune 的搜索列表保持一致)
+        RAJ=""
+        for cand in /usr/local/bin/ryzenadj /usr/bin/ryzenadj; do
+            if [[ -x "$cand" ]]; then
+                RAJ="$cand"
+                break
+            fi
+        done
+        if [[ -n "$RAJ" ]]; then
+            echo "ryzenadj=ok|$RAJ"
+        else
+            echo "ryzenadj=fail|未找到 ryzenadj 二进制 (见 README 安装章节)"
+            rc=1
+        fi
+
+        # ryzen_smu 模块 (/sys/module/ 比 lsmod|grep 更可靠, 无需额外命令解析)
+        if [[ -d /sys/module/ryzen_smu ]]; then
+            echo "ryzen_smu=ok|已加载"
+        elif modprobe ryzen_smu 2>/dev/null && [[ -d /sys/module/ryzen_smu ]]; then
+            echo "ryzen_smu=ok|本次已加载 (未持久化, 见 README DKMS 配置)"
+        else
+            echo "ryzen_smu=fail|未加载且 modprobe 失败 (见 README ryzen_smu 安装)"
+            rc=1
+        fi
+
+        # sysfs boost 可写 (-w 测试写权限, 不试写以免改状态)
+        if [[ -w "$BOOST_SYS" ]]; then
+            echo "sysfs_boost=ok|可写"
+        else
+            echo "sysfs_boost=fail|$BOOST_SYS 不可写"
+            rc=1
+        fi
+
+        # ryzenadj 试运行 (仅当二进制存在才测; 与守护进程 -i 模式一致, 能暴露 SMU 通信问题)
+        if [[ -n "$RAJ" ]]; then
+            if "$RAJ" -i >/dev/null 2>&1; then
+                echo "ryzenadj_run=ok|SMU 通信正常"
+            else
+                echo "ryzenadj_run=fail|ryzenadj -i 失败, 检查 ryzen_smu / 权限"
+                rc=1
+            fi
+        fi
+
+        exit "$rc"
+        ;;
+
     *)
-        echo "Usage: $0 {lock|unlock|tune eco|balance|performance|off|status}" >&2
+        echo "Usage: $0 {lock|unlock|tune eco|balance|performance|off|status|preflight}" >&2
         exit 1
         ;;
 esac

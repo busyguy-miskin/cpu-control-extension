@@ -15,6 +15,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
@@ -34,6 +35,63 @@ function readSys(path) {
     } catch (e) {
         return null;
     }
+}
+
+// ============================================================
+// 用户态环境检查 (免密, 即时, 静默降级)
+// ============================================================
+// 设计: 扩展启动 / 打开菜单时跑这套, 不弹任何密码框, 立即出结果。
+//       深度检查 (ryzenadj/ryzen_smu 等) 需提权, 延迟到用户点调优时
+//       顺带做 (见 _runPreflightThen)。
+//
+// 区分两类缺失:
+//   - 阻断性 (pkexec/cpuctrl 缺): 所有提权操作失效 → 菜单项置灰
+//   - 降级性 (journalctl 缺): 只丢 MCE 计数, 其余功能正常 → 仅警告
+
+// command -v <cmd> 是否存在 (用户态可查的工具)
+function commandExists(cmd) {
+    try {
+        const [, stdout] = GLib.spawn_command_line_sync(
+            `sh -c 'command -v ${cmd}'`);
+        return new TextDecoder().decode(stdout).trim().length > 0;
+    } catch (e) {
+        return false;
+    }
+}
+
+// cpuctrl helper 是否就位 (install.sh 的产物)
+function helperInstalled() {
+    return Gio.File.new_for_path(HELPER).query_exists(null);
+}
+
+// 是否 AMD Ryzen (读 cpuinfo, 防 Intel/其他平台误装)
+// 读不到 cpuinfo 时宽松返回 true (不阻断, 避免假阳性)
+function isAmdRyzen() {
+    const cpuinfo = readSys('/proc/cpuinfo');
+    if (!cpuinfo) return true;
+    return /vendor_id.*AuthenticAMD/i.test(cpuinfo) && /model name.*Ryzen/i.test(cpuinfo);
+}
+
+// 运行用户态检查全集。
+// 返回 { ok: bool, items: [{key, ok, msg}] }
+//   ok=false 表示有阻断性缺失 (journalctl 缺失只降级, 不算阻断)
+function checkUserland() {
+    const items = [];
+    // [key, 是否通过, 缺失时的提示文案]
+    const checks = [
+        ['amd_ryzen', isAmdRyzen(), '非 AMD Ryzen 平台 (本扩展仅适用 Ryzen)'],
+        ['pkexec', commandExists('pkexec'), '缺少 pkexec (安装 policykit-1)'],
+        ['systemctl', commandExists('systemctl'), '缺少 systemctl'],
+        ['journalctl', commandExists('journalctl'), '缺少 journalctl (MCE 计数将不可用)'],
+        ['cpuctrl', helperInstalled(), '缺少 root helper /usr/libexec/cpuctrl (重跑 install.sh)'],
+    ];
+    let ok = true;
+    for (const [key, pass, msg] of checks) {
+        items.push({key, ok: pass, msg});
+        // journalctl 缺失只降级 MCE 计数, 不阻断核心功能
+        if (!pass && key !== 'journalctl') ok = false;
+    }
+    return {ok, items};
 }
 
 // 读 k10temp 温度(CPU 核温)。遍历 hwmon 找 name==k10temp 的那颗
@@ -212,13 +270,29 @@ export const CpuIndicator = GObject.registerClass(
             this._cpuTemp = null;
             this._freq = null;
 
+            // 环境检查: 用户态检查免密即时 (扩展启动就做);
+            //           深度检查 (preflight) 需提权, 延迟到用户点调优时顺带做。
+            // _preflightCache: null=未做过深度检查; {items, ts}=已做并缓存。
+            this._envCheck = checkUserland();
+            this._preflightCache = null;
+
             // 构建菜单
             this._buildMenu();
 
-            // 打开菜单时强制刷新状态行文字 → 再打开看到的一定是最新值
-            // (解决"点完操作后状态显示滞后"的体验问题)
+            // 打开菜单时: 重跑用户态检查 (用户可能中途装了缺失依赖) + 强制刷新状态行
+            // 重跑开销低 (5 个 command -v), 只在打开瞬间做一次, 不进 2s 定时器。
+            // 若检查结果变化 (如从有警告变无警告), 重建菜单以刷新警告区/置灰状态。
             this._menuOpenId = this.menu.connect('open-state-changed', (menu, open) => {
-                if (open) this._refreshMenuItems();
+                if (!open) return;
+                const prevOk = this._envCheck.ok;
+                const prevFails = this._collectFailedChecks().length;
+                this._envCheck = checkUserland();
+                if (this._envCheck.ok !== prevOk ||
+                    this._collectFailedChecks().length !== prevFails) {
+                    this._rebuildMenu();
+                } else {
+                    this._refreshMenuItems();
+                }
             });
 
             // 启动定时器(2s 刷新温度/频率/boost, 30s 刷新 MCE)
@@ -239,6 +313,23 @@ export const CpuIndicator = GObject.registerClass(
         _buildMenu() {
             this.menu.removeAll();
             this._locked = readBoost() === '0';
+            this._warningItems = [];
+
+            // ===== 警告区 (有环境问题时显示, 置于最顶部) =====
+            // 来源两类: 用户态检查 fail 项 + preflight 深度检查 fail 项
+            const failedItems = this._collectFailedChecks();
+            if (failedItems.length > 0) {
+                const header = this._makeStatusItem('⚠️ 环境检查发现问题:');
+                header.label.add_style_class_name('cpuctrl-warn');
+                this.menu.addMenuItem(header);
+                this._warningItems.push(header);
+                for (const msg of failedItems) {
+                    const item = this._makeStatusItem(`  • ${msg}`);
+                    this.menu.addMenuItem(item);
+                    this._warningItems.push(item);
+                }
+                this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            }
 
             // ===== 顶部: 全部状态展示(只读, 不可点击) =====
             this._statusFreq = this._makeStatusItem(
@@ -258,17 +349,42 @@ export const CpuIndicator = GObject.registerClass(
 
             // ===== Boost 控制(子菜单) =====
             const boostSub = new PopupMenu.PopupSubMenuMenuItem('Boost 控制');
-            this._addActionTo(boostSub.menu, '🔒 锁定 boost (稳定模式)', ['lock']);
-            this._addActionTo(boostSub.menu, '🔓 解锁 boost (性能模式)', ['unlock']);
+            this._addActionTo(boostSub.menu, '🔒 锁定 boost (稳定模式)', ['lock'], 'boost');
+            this._addActionTo(boostSub.menu, '🔓 解锁 boost (性能模式)', ['unlock'], 'boost');
             this.menu.addMenuItem(boostSub);
 
             // ===== 调优档位(子菜单) =====
             const tuneSub = new PopupMenu.PopupSubMenuMenuItem('调优档位');
-            this._addActionTo(tuneSub.menu, '🟢 节能 (80°C / 38W)', ['tune', 'eco']);
-            this._addActionTo(tuneSub.menu, '⚖️ 均衡 (90°C / 45W)', ['tune', 'balance']);
-            this._addActionTo(tuneSub.menu, '🚀 性能 (95°C / 55W)', ['tune', 'performance']);
-            this._addActionTo(tuneSub.menu, '⏹️ 关闭调优 (回出厂)', ['tune', 'off']);
+            this._addActionTo(tuneSub.menu, '🟢 节能 (80°C / 38W)', ['tune', 'eco'], 'tune');
+            this._addActionTo(tuneSub.menu, '⚖️ 均衡 (90°C / 45W)', ['tune', 'balance'], 'tune');
+            this._addActionTo(tuneSub.menu, '🚀 性能 (95°C / 55W)', ['tune', 'performance'], 'tune');
+            this._addActionTo(tuneSub.menu, '⏹️ 关闭调优 (回出厂)', ['tune', 'off'], 'tune');
             this.menu.addMenuItem(tuneSub);
+        }
+
+        // 收集所有未通过的环境检查项文案 (用户态 + preflight)
+        // 用于菜单警告区展示。返回 msg 字符串数组。
+        _collectFailedChecks() {
+            const msgs = [];
+            for (const it of this._envCheck.items) {
+                if (!it.ok) msgs.push(it.msg);
+            }
+            if (this._preflightCache) {
+                for (const it of this._preflightCache.items) {
+                    if (!it.ok) msgs.push(it.msg);
+                }
+            }
+            return msgs;
+        }
+
+        // 是否存在任何环境问题 (用户态阻断项 或 preflight fail 项)
+        // 决定顶栏是否显示 ⚠️ 标记
+        _hasEnvIssue() {
+            if (!this._envCheck.ok) return true;
+            if (this._preflightCache) {
+                return this._preflightCache.items.some(it => !it.ok);
+            }
+            return false;
         }
 
         // 纯展示菜单项
@@ -284,23 +400,130 @@ export const CpuIndicator = GObject.registerClass(
         }
 
         // 可点击操作按钮, 添加到指定 menu(主菜单或子菜单)。
-        // args 是传给 callHelper 的参数数组
-        _addActionTo(menu, labelText, args) {
-            const item = new PopupMenu.PopupMenuItem(labelText);
-            item.connect('activate', () => {
+        // args 是传给 callHelper 的参数数组。
+        // requires 标明该操作的前置依赖 ('boost'|'tune'):
+        //   - 前置不满足时菜单项置灰, 点击弹 toast 提示原因 (而非静默无反应)
+        //   - tune 操作若未做过深度检查, 点击时顺带触发 preflight
+        _addActionTo(menu, labelText, args, requires = null) {
+            const {blocked, reason} = this._isActionBlocked(requires);
+            const item = new PopupMenu.PopupMenuItem(
+                labelText, {reactive: !blocked});
+            if (blocked) {
+                item.add_style_class_name('cpuctrl-disabled');
+                // 置灰项仍允许点击 (GNOME 会忽略 activate), 这里走非模态提示
+                // 让用户知道"为什么不能点", 见 README 体验说明
+                item.connect('activate', () => {
+                    this._showToast(`⚠️ ${reason}`);
+                });
+            } else {
+                item.connect('activate', () => {
+                    this._onActionActivated(args, requires);
+                });
+            }
+            menu.addMenuItem(item);
+        }
+
+        // 判断某操作是否被前置检查阻断。
+        // 返回 { blocked: bool, reason: string }
+        //   - boost 操作: 用户态检查 (pkexec/cpuctrl/sysfs) 未过 → 阻断
+        //   - tune 操作: 用户态未过 → 阻断; 已做 preflight 且 ryzenadj fail → 阻断;
+        //                未做 preflight → 不阻断 (点击时顺带触发深度检查)
+        _isActionBlocked(requires) {
+            if (!requires) return {blocked: false, reason: ''};
+            if (!this._envCheck.ok) {
+                return {blocked: true, reason: '环境检查未通过, 见菜单警告区'};
+            }
+            if (requires === 'tune' && this._preflightCache) {
+                const raj = this._preflightCache.items.find(it => it.key === 'ryzenadj');
+                if (raj && !raj.ok) {
+                    return {blocked: true, reason: '缺少 ryzenadj, 见菜单警告区'};
+                }
+            }
+            return {blocked: false, reason: ''};
+        }
+
+        // 操作点击统一入口: 关菜单 → (tune 且未做深度检查时顺带 preflight) → callHelper → 错峰刷新
+        _onActionActivated(args, requires) {
+            this.menu.close(true);
+            if (requires === 'tune' && !this._preflightCache) {
+                // 顺带深度检查: 复用即将弹的 polkit 密码框, 不额外打扰
+                this._runPreflightThen(args);
+            } else {
                 callHelper(args);
-                this.menu.close(true);
-                // pkexec 异步执行, 耗时不确定(输密码、systemctl 操作)。
-                // 单次刷新可能撞在"还没写完"的瞬间读到旧值 → 显示滞后。
-                // 多次错峰刷新覆盖慢场景: 1s 快速反馈, 2.5s 覆盖常规, 5s 兜底。
-                [1000, 2500, 5000].forEach(delay => {
-                    GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
-                        this._refreshFast();
-                        return GLib.SOURCE_REMOVE;
-                    });
+            }
+            // pkexec 异步执行, 耗时不确定(输密码、systemctl 操作)。
+            // 单次刷新可能撞在"还没写完"的瞬间读到旧值 → 显示滞后。
+            // 多次错峰刷新覆盖慢场景: 1s 快速反馈, 2.5s 覆盖常规, 5s 兜底。
+            [1000, 2500, 5000].forEach(delay => {
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+                    this._refreshFast();
+                    return GLib.SOURCE_REMOVE;
                 });
             });
-            menu.addMenuItem(item);
+        }
+
+        // 顺带深度检查: 跑 preflight (弹一次 polkit), 通过则执行实际操作。
+        // 复用 tune 操作本就要弹的密码框, 不额外打扰; 结果缓存, 后续 tune 不再弹。
+        _runPreflightThen(args) {
+            let proc;
+            try {
+                proc = Gio.Subprocess.new(
+                    ['pkexec', HELPER, 'preflight'],
+                    Gio.SubprocessFlags.STDOUT_PIPE);
+            } catch (e) {
+                log(`[cpu-control] 启动 preflight 失败: ${e.message}`);
+                // 启动失败属于环境异常, 不执行操作
+                this._showToast('⚠️ 无法启动深度检查, 操作已取消');
+                return;
+            }
+            proc.communicate_utf8_async(null, null, (p, res) => {
+                let items = [];
+                let passed = false;
+                try {
+                    const [, stdout] = p.communicate_utf8_finish(res);
+                    items = this._parsePreflight(stdout);
+                    passed = items.length > 0 && items.every(it => it.ok);
+                } catch (e) {
+                    // polkit 取消或 preflight 崩溃 → 视为未通过, 不继续操作
+                    log(`[cpu-control] preflight 失败: ${e.message}`);
+                }
+                this._preflightCache = {items, ts: Date.now()};
+                this._rebuildMenu();
+                if (passed) {
+                    callHelper(args);
+                } else {
+                    this._showToast('⚠️ 深度检查未通过, 见菜单警告区, 操作已取消');
+                }
+            });
+        }
+
+        // 解析 cpuctrl preflight 的 "key=state|msg" 输出为结构化数组
+        // state ∈ ok|fail|warn; ok 判定: state !== 'fail'
+        _parsePreflight(stdout) {
+            const items = [];
+            for (const line of stdout.split('\n')) {
+                const m = line.match(/^(\w+)=(ok|fail|warn)\|(.*)$/);
+                if (m) {
+                    items.push({key: m[1], ok: m[2] !== 'fail', level: m[2], msg: m[3]});
+                }
+            }
+            return items;
+        }
+
+        // 根据最新 envCheck/preflightCache 重建菜单 (刷新警告区 + 置灰状态)
+        _rebuildMenu() {
+            this._buildMenu();
+            this._refreshMenuItems();
+        }
+
+        // 非模态提示 (GNOME 系统通知), 轻量不打断
+        // 用于告知用户"为何操作不可用 / 为何被取消"
+        _showToast(text) {
+            try {
+                Main.notify('CPU 控制', text);
+            } catch (e) {
+                log(`[cpu-control] notify 失败: ${e.message}`);
+            }
         }
 
         // ---------- 刷新 ----------
@@ -333,7 +556,9 @@ export const CpuIndicator = GObject.registerClass(
 
             // 更新顶栏(随时刷新)
             this._tempLabel.text = temp !== null ? `${temp}°` : '—°';
-            this._lockIcon.text = this._locked ? '🔒' : '🔓';
+            // 有环境问题时追加 ⚠️, 提示用户打开菜单查看
+            this._lockIcon.text = (this._locked ? '🔒' : '🔓') +
+                (this._hasEnvIssue() ? '⚠️' : '');
             this._freqLabel.text = formatFreqCompact(freq);
 
             // 菜单项文字每个 tick 都刷新 (含打开期间), 让菜单内温度与顶栏一致;
